@@ -1,2 +1,3 @@
-# MS_BestModel
-Best Model for JACSNET
+# MS Best Model
+##Best Model for JACSNET
+###Joint Classification and Separation Network for Monaural Music Separation
