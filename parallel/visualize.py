@@ -1,0 +1,165 @@
+# JACSNET Prediction
+# Author: Vanessa H. Tan 01/25/19
+
+# get libraries
+import sys
+import numpy as np
+import pandas as pd
+import scipy
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import math
+
+import librosa
+import librosa.display
+from librosa.output import write_wav
+
+import keras
+from keras.models import Model
+from keras.layers import *
+from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from keras import optimizers
+import keras.backend as K
+import norbert
+from matplotlib import pyplot
+
+from model import UNETmodule, RECOVmodule
+from utils import spectowav
+
+def custom_loss_wrapper_a(mask):
+    def custom_loss_a(y_true, y_pred):
+        mae = K.mean(K.abs(np.multiply(mask, y_pred) - y_true), axis=-1)
+
+        y_true = K.clip(y_true, K.epsilon(), 1)
+        y_pred = K.clip(np.multiply(mask, y_pred), K.epsilon(), 1)
+        KL = K.sum(y_true * K.log(y_true / y_pred), axis=-1)
+
+        return mae + (0.5*KL)
+    return custom_loss_a
+
+def binary_focal_loss(gamma=2., alpha=.25):
+    """
+    Binary form of focal loss.
+      FL(p_t) = -alpha * (1 - p_t)**gamma * log(p_t)
+      where p = sigmoid(x), p_t = p or 1 - p depending on if the label is 1 or 0, respectively.
+    References:
+        https://arxiv.org/pdf/1708.02002.pdf
+    Usage:
+     model.compile(loss=[binary_focal_loss(alpha=.25, gamma=2)], metrics=["accuracy"], optimizer=adam)
+    """
+    def binary_focal_loss_fixed(y_true, y_pred):
+        """
+        :param y_true: A tensor of the same shape as `y_pred`
+        :param y_pred:  A tensor resulting from a sigmoid
+        :return: Output tensor.
+        """
+        pt_1 = tf.where(tf.equal(y_true, 1), y_pred, tf.ones_like(y_pred))
+        pt_0 = tf.where(tf.equal(y_true, 0), y_pred, tf.zeros_like(y_pred))
+
+        epsilon = K.epsilon()
+        # clip to prevent NaN's and Inf's
+        pt_1 = K.clip(pt_1, epsilon, 1. - epsilon)
+        pt_0 = K.clip(pt_0, epsilon, 1. - epsilon)
+
+        return -K.sum(alpha * K.pow(1. - pt_1, gamma) * K.log(pt_1)) \
+               -K.sum((1 - alpha) * K.pow(pt_0, gamma) * K.log(1. - pt_0))
+
+    return binary_focal_loss_fixed
+
+def crop(dimension, start, end):
+    # Crops (or slices) a Tensor on a given dimension from start to end
+    # example : to crop tensor x[:, :, 5:10]
+    # call slice(2, 5, 10) as you want to crop on the second dimension
+    def func(x):
+        if dimension == 0:
+            return x[start: end]
+        if dimension == 1:
+            return x[:, start: end]
+        if dimension == 2:
+            return x[:, :, start: end]
+        if dimension == 3:
+            return x[:, :, :, start: end]
+        if dimension == 4:
+            return x[:, :, :, :, start: end]
+    return Lambda(func)
+
+
+def main(args):
+
+    # Parameters
+    seed = 3
+    num_classes = 4
+    num_epochs = 100
+    drop_prob = 0
+    learning_rate = 1e-4
+    window_size = 2048
+    hop_size = 512
+    window = np.blackman(window_size)
+
+    # Model Architecture
+    inputs = Input(shape=[1025, 94, 1])
+
+    UNETout1 = UNETmodule(inputs, num_classes, drop_prob)
+    sep_sources = Activation('softmax', name='sep_sources')(UNETout1)
+
+    UNETout2 = UNETmodule(sep_sources, 1, drop_prob)
+    recov_input = Activation('sigmoid', name='recov_input')(UNETout2)
+
+    sourceclass = GlobalAveragePooling2D()(sep_sources)
+    sourceclass = Dense(128, activation='relu')(sourceclass)
+    sourceclass = Dense(128, activation='relu')(sourceclass)
+    sourceclass = Dense(128, activation='relu')(sourceclass)
+    sourceclass = Dense(num_classes)(sourceclass)
+    sourceclass = Activation('sigmoid', name='sourceclass')(sourceclass)
+
+    # Train Model Architecture
+    loss_funcs = {
+        "sep_sources": custom_loss_wrapper_a(mask = inputs),
+        "sourceclass": binary_focal_loss(),
+        "recov_input": custom_loss_wrapper_a(mask = inputs)
+    }
+    lossWeights = {"sep_sources": 10, "sourceclass": 0.01, "recov_input": 10}
+    optimizer = optimizers.Adam(lr=learning_rate)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', patience=5)
+    model = Model(inputs=inputs, outputs=[sep_sources, sourceclass, recov_input])
+    model.compile(loss=loss_funcs, optimizer=optimizer, loss_weights=lossWeights)
+
+    # Load Model
+    model.load_weights("model_weightsv2.hdf5")
+
+    for i in range(len(model.layers)):
+        layer = model.layers[i]
+        # if 'conv' not in layer.name:
+        #     continue
+        print(i, layer.name, layer.output.shape)
+
+    model = Model(inputs=model.inputs, outputs=model.layers[27].output)
+
+    # Predict
+    audio, sr = librosa.load("Angels In Amplifiers - I'm Alright_slice.wav", offset=0, duration=3, mono=True, sr=16000)
+    # audio = librosa.util.normalize(audio, norm=np.inf, axis=None)
+    # write_wav('mix.wav', audio, sr, norm=True)
+    orig = librosa.core.stft(audio, hop_length=hop_size, n_fft=window_size, window=window)
+    magnitude, phase = librosa.magphase(orig)
+    orig_norm = 2 * magnitude / np.sum(window)
+
+    X = np.reshape(orig_norm, (1, 1025, 94, 1))
+    X = X.astype('float32')
+
+    feature_maps  = model.predict(X)
+
+    square = 2
+    ix = 1
+    for _ in range(square):
+	    for _ in range(square):
+		# specify subplot and turn of axis
+		      ax = pyplot.subplot(square, square, ix)
+		      ax.set_xticks([])
+		      ax.set_yticks([])
+		# plot filter channel in grayscale
+		      pyplot.imshow(feature_maps[0, :, :, ix-1], aspect='auto', cmap='viridis')
+		      ix += 1
+    pyplot.show()
+
+if __name__ == "__main__":
+	main(sys.argv)
